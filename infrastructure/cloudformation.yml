@@ -1,0 +1,500 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: DocuVault - 8 Lambda Microservices, API Gateway Routes & Cognito Authentication (Reuses Existing AWS Resources)
+
+Parameters:
+  ExistingS3Bucket:
+    Type: String
+    Default: 'docuvault-storage-jainish'
+    Description: Existing S3 bucket for documents storage
+
+  ExistingDynamoDBTable:
+    Type: String
+    Default: 'DocuVaultDocuments'
+    Description: Existing DynamoDB table name (partition key user_id, sort key document_id)
+
+  ExistingLambdaRoleArn:
+    Type: String
+    Default: ''
+    Description: Optional full ARN for existing DocuVaultLambdaRole. If omitted, defaults to arn:aws:iam::<AccountId>:role/DocuVaultLambdaRole
+
+  ExistingApiGatewayId:
+    Type: String
+    Default: 'b4reqq8h9a'
+    Description: Existing API Gateway HTTP API ID
+
+  LambdaDeploymentBucket:
+    Type: String
+    Default: 'docuvault-storage-jainish'
+    Description: S3 bucket where packaged lambda zip files are uploaded (e.g. lambda/createUploadUrl.zip)
+
+  EnvironmentName:
+    Type: String
+    Default: 'prod'
+    AllowedValues: [dev, staging, prod]
+
+  CreateCognitoUserPool:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create a dedicated Cognito User Pool & App Client for student authentication.
+
+  ExistingCognitoUserPoolId:
+    Type: String
+    Default: ''
+    Description: Optional existing Cognito User Pool ID (used only if CreateCognitoUserPool is false)
+
+  ExistingCognitoUserPoolClientId:
+    Type: String
+    Default: ''
+    Description: Optional existing Cognito App Client ID (used only if CreateCognitoUserPool is false)
+
+  SnsTopicArn:
+    Type: String
+    Default: ''
+    Description: Optional SNS Topic ARN for expiry notifications
+
+Conditions:
+  HasCustomRole: !Not [!Equals [!Ref ExistingLambdaRoleArn, '']]
+  HasSnsTopic: !Not [!Equals [!Ref SnsTopicArn, '']]
+  ShouldCreateCognito: !Equals [!Ref CreateCognitoUserPool, 'true']
+  HasExistingCognito: !Not [!Equals [!Ref ExistingCognitoUserPoolId, '']]
+  EnableCognitoAuth: !Or [!Equals [!Ref CreateCognitoUserPool, 'true'], !Not [!Equals [!Ref ExistingCognitoUserPoolId, '']]]
+
+Resources:
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1. Cognito User Pool & App Client (Optional / Automated Creation)
+  # ──────────────────────────────────────────────────────────────────────────
+  DocuVaultUserPool:
+    Type: AWS::Cognito::UserPool
+    Condition: ShouldCreateCognito
+    Properties:
+      UserPoolName: !Sub 'DocuVault-Users-${EnvironmentName}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+
+  DocuVaultUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: ShouldCreateCognito
+    Properties:
+      ClientName: DocuVaultWebApp
+      UserPoolId: !Ref DocuVaultUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  DocuVaultAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Condition: ShouldCreateCognito
+    Properties:
+      GroupName: admins
+      Description: DocuVault Administrators
+      UserPoolId: !Ref DocuVaultUserPool
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. Lambda Functions (8 Microservices, Node.js 22.x)
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # 2.1 Create Upload URL
+  CreateUploadUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'DocuVault-CreateUploadUrl-${EnvironmentName}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !If [HasCustomRole, !Ref ExistingLambdaRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/DocuVaultLambdaRole']
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ExistingDynamoDBTable
+          S3_BUCKET: !Ref ExistingS3Bucket
+          CORS_ORIGIN: '*'
+          MAX_FILE_SIZE_MB: '20'
+      Code:
+        S3Bucket: !Ref LambdaDeploymentBucket
+        S3Key: lambda/createUploadUrl.zip
+
+  # 2.2 Process Document (triggered by S3 ObjectCreated)
+  ProcessDocumentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'DocuVault-ProcessDocument-${EnvironmentName}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !If [HasCustomRole, !Ref ExistingLambdaRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/DocuVaultLambdaRole']
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ExistingDynamoDBTable
+          USE_TEXTRACT: 'true'
+      Code:
+        S3Bucket: !Ref LambdaDeploymentBucket
+        S3Key: lambda/processDocument.zip
+
+  # S3 trigger invoke permission for ProcessDocument
+  S3InvokeProcessDocumentPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ProcessDocumentFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:s3:::${ExistingS3Bucket}'
+
+  # 2.3 List Documents
+  ListDocumentsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'DocuVault-ListDocuments-${EnvironmentName}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !If [HasCustomRole, !Ref ExistingLambdaRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/DocuVaultLambdaRole']
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ExistingDynamoDBTable
+          CORS_ORIGIN: '*'
+      Code:
+        S3Bucket: !Ref LambdaDeploymentBucket
+        S3Key: lambda/listDocuments.zip
+
+  # 2.4 Get Document
+  GetDocumentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'DocuVault-GetDocument-${EnvironmentName}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !If [HasCustomRole, !Ref ExistingLambdaRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/DocuVaultLambdaRole']
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ExistingDynamoDBTable
+          S3_BUCKET: !Ref ExistingS3Bucket
+          CORS_ORIGIN: '*'
+      Code:
+        S3Bucket: !Ref LambdaDeploymentBucket
+        S3Key: lambda/getDocument.zip
+
+  # 2.5 Delete Document
+  DeleteDocumentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'DocuVault-DeleteDocument-${EnvironmentName}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !If [HasCustomRole, !Ref ExistingLambdaRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/DocuVaultLambdaRole']
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ExistingDynamoDBTable
+          S3_BUCKET: !Ref ExistingS3Bucket
+          CORS_ORIGIN: '*'
+      Code:
+        S3Bucket: !Ref LambdaDeploymentBucket
+        S3Key: lambda/deleteDocument.zip
+
+  # 2.6 Search Documents
+  SearchDocumentsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'DocuVault-SearchDocuments-${EnvironmentName}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !If [HasCustomRole, !Ref ExistingLambdaRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/DocuVaultLambdaRole']
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ExistingDynamoDBTable
+          CORS_ORIGIN: '*'
+      Code:
+        S3Bucket: !Ref LambdaDeploymentBucket
+        S3Key: lambda/searchDocuments.zip
+
+  # 2.7 Admin Statistics
+  AdminStatsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'DocuVault-AdminStats-${EnvironmentName}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !If [HasCustomRole, !Ref ExistingLambdaRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/DocuVaultLambdaRole']
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ExistingDynamoDBTable
+          CORS_ORIGIN: '*'
+      Code:
+        S3Bucket: !Ref LambdaDeploymentBucket
+        S3Key: lambda/adminStats.zip
+
+  # 2.8 Send Expiry Notifications
+  SendExpiryNotificationsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'DocuVault-SendExpiryNotifications-${EnvironmentName}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !If [HasCustomRole, !Ref ExistingLambdaRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/DocuVaultLambdaRole']
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ExistingDynamoDBTable
+          EXPIRY_THRESHOLD_DAYS: '30'
+          SNS_TOPIC_ARN: !If [HasSnsTopic, !Ref SnsTopicArn, !Ref 'AWS::NoValue']
+      Code:
+        S3Bucket: !Ref LambdaDeploymentBucket
+        S3Key: lambda/sendExpiryNotifications.zip
+
+  # EventBridge Rule for Daily Expiry Check
+  ExpiryCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'DocuVault-DailyExpiryCheck-${EnvironmentName}'
+      Description: Triggers daily expiry check Lambda for DocuVault
+      ScheduleExpression: 'cron(0 6 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: SendExpiryNotificationsTarget
+          Arn: !GetAtt SendExpiryNotificationsFunction.Arn
+
+  ExpiryCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SendExpiryNotificationsFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ExpiryCheckRule.Arn
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. Cognito JWT Authorizer (on Existing API Gateway)
+  # ──────────────────────────────────────────────────────────────────────────
+  CognitoAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: EnableCognitoAuth
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Audience:
+          - !If [ShouldCreateCognito, !Ref DocuVaultUserPoolClient, !Ref ExistingCognitoUserPoolClientId]
+        Issuer: !If
+          - ShouldCreateCognito
+          - !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${DocuVaultUserPool}'
+          - !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${ExistingCognitoUserPoolId}'
+      Name: CognitoJWTAuthorizer
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 4. API Gateway Routes & Integrations (Existing API ID: b4reqq8h9a)
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # Route 1: POST /documents/upload-url
+  CreateUploadUrlIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CreateUploadUrlFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  RouteUploadUrl:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      RouteKey: 'POST /documents/upload-url'
+      Target: !Sub 'integrations/${CreateUploadUrlIntegration}'
+      AuthorizationType: !If [EnableCognitoAuth, 'JWT', 'NONE']
+      AuthorizerId: !If [EnableCognitoAuth, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+
+  CreateUploadUrlApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CreateUploadUrlFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingApiGatewayId}/*/*/*'
+
+  # Route 2: GET /documents
+  ListDocumentsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ListDocumentsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  RouteListDocuments:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      RouteKey: 'GET /documents'
+      Target: !Sub 'integrations/${ListDocumentsIntegration}'
+      AuthorizationType: !If [EnableCognitoAuth, 'JWT', 'NONE']
+      AuthorizerId: !If [EnableCognitoAuth, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+
+  ListDocumentsApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ListDocumentsFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingApiGatewayId}/*/*/*'
+
+  # Route 3: GET /documents/search (Literal route matched before parameter segment)
+  SearchDocumentsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt SearchDocumentsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  RouteSearchDocuments:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      RouteKey: 'GET /documents/search'
+      Target: !Sub 'integrations/${SearchDocumentsIntegration}'
+      AuthorizationType: !If [EnableCognitoAuth, 'JWT', 'NONE']
+      AuthorizerId: !If [EnableCognitoAuth, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+
+  SearchDocumentsApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SearchDocumentsFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingApiGatewayId}/*/*/*'
+
+  # Route 4: GET /documents/{document_id}
+  GetDocumentIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetDocumentFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  RouteGetDocument:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      RouteKey: 'GET /documents/{document_id}'
+      Target: !Sub 'integrations/${GetDocumentIntegration}'
+      AuthorizationType: !If [EnableCognitoAuth, 'JWT', 'NONE']
+      AuthorizerId: !If [EnableCognitoAuth, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+
+  GetDocumentApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GetDocumentFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingApiGatewayId}/*/*/*'
+
+  # Route 5: DELETE /documents/{document_id}
+  DeleteDocumentIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DeleteDocumentFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  RouteDeleteDocument:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      RouteKey: 'DELETE /documents/{document_id}'
+      Target: !Sub 'integrations/${DeleteDocumentIntegration}'
+      AuthorizationType: !If [EnableCognitoAuth, 'JWT', 'NONE']
+      AuthorizerId: !If [EnableCognitoAuth, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+
+  DeleteDocumentApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DeleteDocumentFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingApiGatewayId}/*/*/*'
+
+  # Route 6: GET /admin/statistics
+  AdminStatsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AdminStatsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  RouteAdminStats:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExistingApiGatewayId
+      RouteKey: 'GET /admin/statistics'
+      Target: !Sub 'integrations/${AdminStatsIntegration}'
+      AuthorizationType: !If [EnableCognitoAuth, 'JWT', 'NONE']
+      AuthorizerId: !If [EnableCognitoAuth, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+
+  AdminStatsApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AdminStatsFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingApiGatewayId}/*/*/*'
+
+Outputs:
+  ApiEndpoint:
+    Description: Existing API Gateway Base URL
+    Value: !Sub 'https://${ExistingApiGatewayId}.execute-api.${AWS::Region}.amazonaws.com/'
+
+  S3BucketName:
+    Description: Existing S3 bucket configured for documents
+    Value: !Ref ExistingS3Bucket
+
+  DynamoDBTableName:
+    Description: Existing DynamoDB table configured for metadata
+    Value: !Ref ExistingDynamoDBTable
+
+  ProcessDocumentFunctionArn:
+    Description: ARN of ProcessDocument Lambda (for S3 event notification configuration)
+    Value: !GetAtt ProcessDocumentFunction.Arn
+
+  CognitoUserPoolId:
+    Condition: ShouldCreateCognito
+    Description: Created Cognito User Pool ID
+    Value: !Ref DocuVaultUserPool
+
+  CognitoUserPoolClientId:
+    Condition: ShouldCreateCognito
+    Description: Created Cognito App Client ID (paste into frontend .env)
+    Value: !Ref DocuVaultUserPoolClient
