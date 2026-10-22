@@ -59,7 +59,14 @@ export default function LoginPage() {
         transition={{ duration: 0.3, ease: 'easeOut' }}
       >
         {/* Brand Logo Header */}
-        <div className="auth-logo">
+        <div
+          className="auth-logo"
+          onClick={() => window.dispatchEvent(new CustomEvent('docuvault:replay-intro'))}
+          title="Click to replay startup animation"
+          style={{ cursor: 'pointer' }}
+          role="button"
+          tabIndex={0}
+        >
           <div className="auth-logo-icon">
             <FileText size={24} color="#181818" strokeWidth={2.4} />
           </div>

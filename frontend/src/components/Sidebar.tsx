@@ -52,8 +52,15 @@ export default function Sidebar({ isOpen = true, onClose }: SidebarProps) {
       )}
 
       <aside className={`sidebar ${isOpen ? 'open' : ''}`}>
-        {/* Brand Logo */}
-        <div className="sidebar-logo">
+        {/* Brand Logo (click to replay intro animation) */}
+        <div
+          className="sidebar-logo"
+          onClick={() => window.dispatchEvent(new CustomEvent('docuvault:replay-intro'))}
+          title="Click to replay intro animation"
+          style={{ cursor: 'pointer' }}
+          role="button"
+          tabIndex={0}
+        >
           <div className="sidebar-logo-icon">
             <FileText size={22} color="#181818" strokeWidth={2.4} />
           </div>

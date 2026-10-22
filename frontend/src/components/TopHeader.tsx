@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import SystemStatusIndicator from './SystemStatusIndicator';
-import { Search, Upload, Menu } from 'lucide-react';
+import { Search, Upload, Menu, Sparkles } from 'lucide-react';
 
 interface TopHeaderProps {
   onOpenSidebar: () => void;
@@ -51,6 +51,18 @@ export default function TopHeader({ onOpenSidebar }: TopHeaderProps) {
       <div className="top-header-actions">
         {/* Connected System Indicator */}
         <SystemStatusIndicator />
+
+        {/* Replay Intro Animation Button */}
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={() => window.dispatchEvent(new CustomEvent('docuvault:replay-intro'))}
+          title="Replay 2s Startup Animation"
+          style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.8rem' }}
+          id="btn-replay-intro"
+        >
+          <Sparkles size={14} color="#a3b836" />
+          <span style={{ display: 'inline-block' }}>Intro</span>
+        </button>
 
         {/* Quick Upload Action */}
         <button
